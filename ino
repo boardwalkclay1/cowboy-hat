@@ -1,23 +1,12 @@
 /****************************************************
- *  COWBOY HAT OS – GO TIME EDITION
- *  ESP8266 + OLED + 4 Vibration Motors
- *  Phone-driven awareness + radar + IMU gestures
- *  Modes:
- *    - Awareness
- *    - Compass
- *    - Navigation
- *    - Stealth
- *    - System
- *    - Weather
- *
- *  Sensitivity Levels:
- *    - Crowd Mode
- *    - Balanced Mode
- *    - Home-Alone Mode
- *
- *  Danger Override:
- *    - Continuous vibration
- *    - OLED shows GO TIME warning
+ *  COWBOY HAT OS – GO TIME EDITION (Speed Fusion)
+ *  - ESP8266 + OLED + 4 Vibration Motors
+ *  - Phone-driven awareness + radar + IMU gestures
+ *  - Modes, sensitivity profiles, danger override
+ *  - Walking speed from:
+ *      1) Phone GPS speed (preferred)
+ *      2) IMU step frequency
+ *      3) IMU acceleration integration
  ****************************************************/
 
 #include <Arduino.h>
@@ -71,6 +60,11 @@ struct IMUState {
   float pitch;
   float roll;
   float yawRate;
+
+  // Speed-related
+  float forwardAccel;    // m/s^2 (estimated along direction of travel)
+  float stepFrequency;   // steps per second
+  bool  stepDetected;    // true when a step event is detected this frame
 };
 
 struct PhoneState {
@@ -80,12 +74,17 @@ struct PhoneState {
 
   String objectType;
   String objectDir;
-  String objectSpeed;
+  String objectSpeed;    // "slow", "medium", "fast"
   bool   danger;
 
+  // Weather
   String weatherSummary;
   float  tempC;
   float  windKph;
+
+  // Speed from phone (GPS)
+  bool  hasSpeed;
+  float speedMps;        // meters per second
 };
 
 struct RadarState {
@@ -99,6 +98,9 @@ IMUState imu;
 PhoneState phone;
 RadarState radar;
 
+// User speed (fused)
+float userSpeedMps = 0.0;
+
 // Gesture thresholds
 const float NOD_THRESHOLD   = 15.0;
 const float TILT_THRESHOLD  = 15.0;
@@ -107,6 +109,9 @@ const float SHAKE_THRESHOLD = 80.0;
 // Danger vibration timing
 unsigned long lastDangerVibe = 0;
 const unsigned long DANGER_VIBE_INTERVAL = 400;
+
+// Time tracking for accel integration
+unsigned long lastSpeedUpdateMs = 0;
 
 // ================== FORWARD DECLARATIONS ==================
 void setupWiFiAP();
@@ -134,6 +139,9 @@ void vibrateMotor(int pin, int ms);
 void vibrateDirection(String dir, String speed);
 void vibrateDangerLoop();
 
+void computeUserSpeed();
+float mapObjectSpeedToMps(const String &speedStr);
+
 // ================== SETUP ==================
 void setup() {
   Serial.begin(115200);
@@ -155,6 +163,12 @@ void setup() {
   phone.objectSpeed = "none";
   phone.danger = false;
   phone.weatherSummary = "Unknown";
+  phone.tempC = 0;
+  phone.windKph = 0;
+  phone.hasSpeed = false;
+  phone.speedMps = 0.0;
+
+  lastSpeedUpdateMs = millis();
 }
 
 // ================== LOOP ==================
@@ -164,12 +178,19 @@ void loop() {
   readIMU(imu);
   readRadar(radar);
 
+  // Compute fused user walking speed
+  computeUserSpeed();
+
   processGestures();
 
   // Danger override
   if (phone.danger) {
     vibrateDangerLoop();
   } else {
+    // Determine object speed in m/s from label
+    float objectSpeedMps = mapObjectSpeedToMps(phone.objectSpeed);
+    float relativeSpeed = objectSpeedMps - userSpeedMps;
+
     // Sensitivity logic
     bool shouldAlert = false;
 
@@ -183,7 +204,13 @@ void loop() {
     }
 
     if (safetyMode == SENSE_HOMEALONE) {
-      shouldAlert = true;
+      if (phone.objectSpeed != "none") shouldAlert = true;
+    }
+
+    // Relative speed danger: if something is gaining on you fast
+    const float RELATIVE_DANGER_THRESHOLD = 2.0; // m/s faster than you
+    if (relativeSpeed > RELATIVE_DANGER_THRESHOLD && safetyMode != SENSE_CROWD) {
+      phone.danger = true;
     }
 
     if (shouldAlert && phone.objectType.length() > 0) {
@@ -261,7 +288,10 @@ void handleStateJson() {
   json += "\"objectSpeed\":\"" + phone.objectSpeed + "\",";
   json += "\"weather\":\"" + phone.weatherSummary + "\",";
   json += "\"tempC\":" + String(phone.tempC, 1) + ",";
-  json += "\"windKph\":" + String(phone.windKph, 1);
+  json += "\"windKph\":" + String(phone.windKph, 1) + ",";
+  json += "\"userSpeedMps\":" + String(userSpeedMps, 2) + ",";
+  json += "\"phoneSpeedMps\":" + String(phone.speedMps, 2) + ",";
+  json += "\"phoneHasSpeed\":" + String(phone.hasSpeed ? "true" : "false");
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -289,10 +319,14 @@ void handlePhoneUpdate() {
   if (server.hasArg("objType"))    phone.objectType = server.arg("objType");
   if (server.hasArg("objDir"))     phone.objectDir = server.arg("objDir");
   if (server.hasArg("objSpeed"))   phone.objectSpeed = server.arg("objSpeed");
-  if (server.hasArg("danger"))     phone.danger = (server.arg("danger") == "1");
+  if (server.hasArg("danger"))     phone.danger = (server.arg("danger") == "1" || server.arg("danger") == "true");
   if (server.hasArg("weather"))    phone.weatherSummary = server.arg("weather");
   if (server.hasArg("temp"))       phone.tempC = server.arg("temp").toFloat();
   if (server.hasArg("wind"))       phone.windKph = server.arg("wind").toFloat();
+  if (server.hasArg("speed")) {
+    phone.speedMps = server.arg("speed").toFloat();
+    phone.hasSpeed = true;
+  }
 
   server.send(200, "text/plain", "PHONE UPDATE OK");
 }
@@ -415,7 +449,9 @@ void drawHUD() {
       if (safetyMode == SENSE_HOMEALONE) display.print("Home-Alone Mode");
 
       display.setCursor(0, 44);
-      display.print("Tilt L/R to change");
+      display.print("User v: ");
+      display.print(userSpeedMps, 1);
+      display.print(" m/s");
       break;
     }
 
@@ -445,12 +481,19 @@ void drawHUD() {
 
 // ================== IMU + RADAR STUBS ==================
 void readIMU(IMUState &s) {
+  // TODO: replace with real IMU reads
   s.pitch = 0;
   s.roll = 0;
   s.yawRate = 0;
+
+  // Speed-related stubs
+  s.forwardAccel = 0;     // m/s^2
+  s.stepFrequency = 0;    // steps per second
+  s.stepDetected = false; // set true when you detect a step
 }
 
 void readRadar(RadarState &r) {
+  // TODO: replace with real radar reads
   r.motionFront = false;
   r.motionBack = false;
   r.strengthFront = 0;
@@ -466,7 +509,7 @@ void processGestures() {
 }
 
 void onNod() {
-  // Select / confirm
+  // Select / confirm – customize per mode if needed
 }
 
 void onTiltLeft() {
@@ -508,4 +551,62 @@ void vibrateDirection(String dir, String speed) {
   else if (dir == "front-left") { f = true; l = true; }
   else if (dir == "front-right") { f = true; r = true; }
   else if (dir == "back-left") { b = true; l = true; }
-  else if (dir == "back-right") { b = true
+  else if (dir == "back-right") { b = true; r = true; }
+
+  if (f) vibrateMotor(VIB_FRONT, pulse);
+  if (b) vibrateMotor(VIB_BACK,  pulse);
+  if (l) vibrateMotor(VIB_LEFT,  pulse);
+  if (r) vibrateMotor(VIB_RIGHT, pulse);
+}
+
+void vibrateDangerLoop() {
+  unsigned long now = millis();
+  if (now - lastDangerVibe >= DANGER_VIBE_INTERVAL) {
+    lastDangerVibe = now;
+    digitalWrite(VIB_FRONT, HIGH);
+    digitalWrite(VIB_BACK,  HIGH);
+    digitalWrite(VIB_LEFT,  HIGH);
+    digitalWrite(VIB_RIGHT, HIGH);
+    delay(120);
+    digitalWrite(VIB_FRONT, LOW);
+    digitalWrite(VIB_BACK,  LOW);
+    digitalWrite(VIB_LEFT,  LOW);
+    digitalWrite(VIB_RIGHT, LOW);
+  }
+}
+
+// ================== SPEED FUSION ==================
+void computeUserSpeed() {
+  unsigned long now = millis();
+  float dt = (now - lastSpeedUpdateMs) / 1000.0; // seconds
+  if (dt <= 0) dt = 0.01;
+  lastSpeedUpdateMs = now;
+
+  // 1) Prefer phone GPS speed if available
+  if (phone.hasSpeed) {
+    userSpeedMps = phone.speedMps;
+    return;
+  }
+
+  // 2) Use IMU step frequency if step detected / stable
+  if (imu.stepFrequency > 0.1f) {
+    // Approximate step length (m). You can calibrate this.
+    const float STEP_LENGTH_M = 0.78f;
+    userSpeedMps = imu.stepFrequency * STEP_LENGTH_M;
+    return;
+  }
+
+  // 3) Fallback: integrate forward acceleration
+  // Very rough, but better than nothing
+  userSpeedMps += imu.forwardAccel * dt;
+
+  // Clamp to non-negative
+  if (userSpeedMps < 0) userSpeedMps = 0;
+}
+
+float mapObjectSpeedToMps(const String &speedStr) {
+  if (speedStr == "slow")   return 1.0; // ~3.6 km/h
+  if (speedStr == "medium") return 3.0; // ~10.8 km/h
+  if (speedStr == "fast")   return 6.0; // ~21.6 km/h
+  return 0.0;
+}
