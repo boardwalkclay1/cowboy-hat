@@ -19,7 +19,6 @@ AsyncWebServer server(80);
 const char* AP_SSID     = "CowboyHatOS-GoTime";
 const char* AP_PASSWORD = "boardwalk";
 
-// Secure uploader credentials
 const char* UPLOAD_USER = "admin";
 const char* UPLOAD_PASS = "cowboy123";
 
@@ -111,31 +110,6 @@ const unsigned long DANGER_VIBE_INTERVAL = 400;
 // Time tracking for accel integration
 unsigned long lastSpeedUpdateMs = 0;
 
-// ================== FORWARD DECLARATIONS ==================
-void setupWiFiAP();
-void setupWebServer();
-
-void setupOLED();
-void drawHUD();
-
-void readIMU(IMUState &s);
-void readRadar(RadarState &r);
-
-void processGestures();
-void onNod();
-void onTiltLeft();
-void onTiltRight();
-void onShake();
-
-void vibrateMotor(int pin, int ms);
-void vibrateDirection(String dir, String speed);
-void vibrateDangerLoop();
-
-void computeUserSpeed();
-float mapObjectSpeedToMps(const String &speedStr);
-
-String dirFromHeading(float h);
-
 // ================== INLINE HTML (ROOT) ==================
 const char HTML_ROOT[] PROGMEM = R"HTML(
 <!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'/>
@@ -169,6 +143,29 @@ setInterval(fetchState,1000);fetchState();
 </script></body></html>
 )HTML";
 
+// ================== FORWARD DECLARATIONS ==================
+void setupWiFiAP();
+void setupWebServer();
+void setupOLED();
+void drawHUD();
+
+void readIMU(IMUState &s);
+void readRadar(RadarState &r);
+
+void processGestures();
+void onNod();
+void onTiltLeft();
+void onTiltRight();
+void onShake();
+
+void vibrateMotor(int pin, int ms);
+void vibrateDirection(String dir, String speed);
+void vibrateDangerLoop();
+
+void computeUserSpeed();
+float mapObjectSpeedToMps(const String &speedStr);
+String dirFromHeading(float h);
+
 // ================== SETUP ==================
 void setup() {
   Serial.begin(115200);
@@ -185,7 +182,7 @@ void setup() {
     Serial.println("SPIFFS mount failed");
   }
 
-  // Create upload.html in SPIFFS
+  // Simple upload page in SPIFFS
   File uploadPage = SPIFFS.open("/upload.html", FILE_WRITE);
   uploadPage.print(
     "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'/>"
@@ -322,21 +319,22 @@ void setupWebServer() {
 
   // Phone update
   server.on("/phone", HTTP_POST, [](AsyncWebServerRequest *request){
-    if (request->hasParam("heading", true))    phone.headingDeg = request->getParam("heading", true)->value().toFloat();
-    if (request->hasParam("direction", true))  phone.direction = request->getParam("direction", true)->value();
-    if (request->hasParam("nav", true))        phone.navInstruction = request->getParam("nav", true)->value();
-    if (request->hasParam("objType", true))    phone.objectType = request->getParam("objType", true)->value();
-    if (request->hasParam("objDir", true))     phone.objectDir = request->getParam("objDir", true)->value();
-    if (request->hasParam("objSpeed", true))   phone.objectSpeed = request->getParam("objSpeed", true)->value();
-    if (request->hasParam("danger", true)) {
-      String d = request->getParam("danger", true)->value();
-      phone.danger = (d == "1" || d == "true");
-    }
-    if (request->hasParam("weather", true))    phone.weatherSummary = request->getParam("weather", true)->value();
-    if (request->hasParam("temp", true))       phone.tempC = request->getParam("temp", true)->value().toFloat();
-    if (request->hasParam("wind", true))       phone.windKph = request->getParam("wind", true)->value().toFloat();
+    auto get = [&](const char* name){
+      return request->hasParam(name, true) ? request->getParam(name, true)->value() : String("");
+    };
+
+    if (request->hasParam("heading", true))    phone.headingDeg = get("heading").toFloat();
+    if (request->hasParam("direction", true))  phone.direction = get("direction");
+    if (request->hasParam("nav", true))        phone.navInstruction = get("nav");
+    if (request->hasParam("objType", true))    phone.objectType = get("objType");
+    if (request->hasParam("objDir", true))     phone.objectDir = get("objDir");
+    if (request->hasParam("objSpeed", true))   phone.objectSpeed = get("objSpeed");
+    if (request->hasParam("danger", true))     phone.danger = (get("danger") == "1" || get("danger") == "true");
+    if (request->hasParam("weather", true))    phone.weatherSummary = get("weather");
+    if (request->hasParam("temp", true))       phone.tempC = get("temp").toFloat();
+    if (request->hasParam("wind", true))       phone.windKph = get("wind").toFloat();
     if (request->hasParam("speed", true)) {
-      phone.speedMps = request->getParam("speed", true)->value().toFloat();
+      phone.speedMps = get("speed").toFloat();
       phone.hasSpeed = true;
     }
 
@@ -356,7 +354,7 @@ void setupWebServer() {
     [](AsyncWebServerRequest *request){
       if (!request->authenticate(UPLOAD_USER, UPLOAD_PASS))
         return request->requestAuthentication();
-      request->send(200, "text/plain", "Upload complete. Refresh the page.");
+      request->send(200, "text/plain", "Upload complete.");
     },
     [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final){
       if (!request->authenticate(UPLOAD_USER, UPLOAD_PASS))
@@ -365,22 +363,16 @@ void setupWebServer() {
       String path = "/" + filename;
 
       if (index == 0) {
-        Serial.printf("UploadStart: %s\n", filename.c_str());
-        if (SPIFFS.exists(path)) {
-          SPIFFS.remove(path);
-        }
+        if (SPIFFS.exists(path)) SPIFFS.remove(path);
       }
 
       File f = SPIFFS.open(path, FILE_APPEND);
-      if (!f) {
-        Serial.println("File open failed");
-        return;
-      }
+      if (!f) return;
       f.write(data, len);
       f.close();
 
       if (final) {
-        Serial.printf("UploadEnd: %s (%u bytes)\n", filename.c_str(), index + len);
+        Serial.printf("Uploaded %s (%u bytes)\n", filename.c_str(), index + len);
       }
     }
   );
@@ -390,7 +382,7 @@ void setupWebServer() {
   });
 
   server.begin();
-  Serial.println("Cowboy Hat OS (ESP32-C3) server started (Async + secure uploader)");
+  Serial.println("Cowboy Hat OS (ESP32-C3) server started");
 }
 
 // ================== OLED HUD ==================
