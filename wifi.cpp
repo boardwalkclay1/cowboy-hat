@@ -1,6 +1,6 @@
 /****************************************************
  *  COWBOY HAT OS – GO TIME EDITION (Speed Fusion)
- *  Unified ESP build: ESP8266 + ESP32 + ESP32-C3
+ *  ESP32-C3 ONLY · Async + Secure SPIFFS
  ****************************************************/
 
 #include <Arduino.h>
@@ -8,53 +8,28 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// ================== BOARD SELECTION ==================
-#if defined(ARDUINO_ARCH_ESP8266)
-  #include <ESP8266WiFi.h>
-  #include <ESP8266WebServer.h>
-  ESP8266WebServer server(80);
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <SPIFFS.h>
 
-  // Vibration motors (ESP8266 D-pins)
-  #define VIB_FRONT  5   // D1
-  #define VIB_BACK   4   // D2
-  #define VIB_LEFT   0   // D3
-  #define VIB_RIGHT  2   // D4
-
-  // I2C default
-  #define OLED_SDA   SDA
-  #define OLED_SCL   SCL
-
-#elif defined(ARDUINO_ARCH_ESP32)
-  #include <WiFi.h>
-  #include <WebServer.h>
-  WebServer server(80);
-
-  // Safe default pins for ESP32 / ESP32-C3 (adjust as needed)
-  // For ESP32-C3, these are typical safe GPIOs (no boot strapping conflict)
-  #if defined(CONFIG_IDF_TARGET_ESP32C3)
-    #define VIB_FRONT  4
-    #define VIB_BACK   5
-    #define VIB_LEFT   6
-    #define VIB_RIGHT  7
-    #define OLED_SDA   8
-    #define OLED_SCL   9
-  #else
-    // Generic ESP32 defaults (you can remap to your wiring)
-    #define VIB_FRONT  14
-    #define VIB_BACK   27
-    #define VIB_LEFT   26
-    #define VIB_RIGHT  25
-    #define OLED_SDA   21
-    #define OLED_SCL   22
-  #endif
-
-#else
-  #error "This sketch requires ESP8266 or ESP32/ESP32-C3."
-#endif
+AsyncWebServer server(80);
 
 // ================== CONFIG ==================
 const char* AP_SSID     = "CowboyHatOS-GoTime";
 const char* AP_PASSWORD = "boardwalk";
+
+// Secure uploader credentials
+const char* UPLOAD_USER = "admin";
+const char* UPLOAD_PASS = "cowboy123";
+
+// Pins (ESP32-C3 safe GPIOs – adjust if needed)
+#define VIB_FRONT  4
+#define VIB_BACK   5
+#define VIB_LEFT   6
+#define VIB_RIGHT  7
+#define OLED_SDA   8
+#define OLED_SCL   9
 
 // OLED
 #define SCREEN_WIDTH 128
@@ -88,8 +63,8 @@ struct IMUState {
   float roll;
   float yawRate;
 
-  float forwardAccel;    // m/s^2
-  float stepFrequency;   // steps per second
+  float forwardAccel;
+  float stepFrequency;
   bool  stepDetected;
 };
 
@@ -139,12 +114,6 @@ unsigned long lastSpeedUpdateMs = 0;
 // ================== FORWARD DECLARATIONS ==================
 void setupWiFiAP();
 void setupWebServer();
-void handleRoot();
-void handleStateJson();
-void handleModeChange();
-void handlePhoneUpdate();
-void handleSensitivityChange();
-void handleNotFound();
 
 void setupOLED();
 void drawHUD();
@@ -165,6 +134,41 @@ void vibrateDangerLoop();
 void computeUserSpeed();
 float mapObjectSpeedToMps(const String &speedStr);
 
+String dirFromHeading(float h);
+
+// ================== INLINE HTML (ROOT) ==================
+const char HTML_ROOT[] PROGMEM = R"HTML(
+<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'/>
+<style>
+body{background:#020617;color:#e5e7eb;font-family:sans-serif;padding:16px;}
+h1{color:#38bdf8;margin-bottom:4px;}
+h2{color:#facc15;margin-top:0;}
+button{padding:8px 12px;margin:4px;border-radius:6px;border:none;background:#facc15;color:#111827;font-weight:600;}
+pre{background:#020617;border:1px solid #1f2937;padding:8px;border-radius:6px;}
+</style></head><body>
+<h1>Go Time Software</h1>
+<h2>Cowboy Hat OS</h2>
+<button onclick='setMode(0)'>Awareness</button>
+<button onclick='setMode(1)'>Compass</button>
+<button onclick='setMode(2)'>Navigation</button>
+<button onclick='setMode(3)'>Stealth</button>
+<button onclick='setMode(4)'>System</button>
+<button onclick='setMode(5)'>Weather</button>
+<h3>Sensitivity</h3>
+<button onclick='setSense(0)'>Crowd</button>
+<button onclick='setSense(1)'>Balanced</button>
+<button onclick='setSense(2)'>Home-Alone</button>
+<h3>State</h3><pre id='stateBox'></pre>
+<script>
+function fetchState(){fetch('/state').then(r=>r.json()).then(j=>{
+  document.getElementById('stateBox').innerText=JSON.stringify(j,null,2);
+});}
+function setMode(m){fetch('/mode',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mode='+m}).then(fetchState);}
+function setSense(s){fetch('/sensitivity',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'sense='+s}).then(fetchState);}
+setInterval(fetchState,1000);fetchState();
+</script></body></html>
+)HTML";
+
 // ================== SETUP ==================
 void setup() {
   Serial.begin(115200);
@@ -176,6 +180,27 @@ void setup() {
   pinMode(VIB_RIGHT, OUTPUT);
 
   Wire.begin(OLED_SDA, OLED_SCL);
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+  }
+
+  // Create upload.html in SPIFFS
+  File uploadPage = SPIFFS.open("/upload.html", FILE_WRITE);
+  uploadPage.print(
+    "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'/>"
+    "<title>Cowboy Hat Upload</title>"
+    "<style>body{background:#020617;color:#e5e7eb;font-family:sans-serif;padding:16px;}h1{color:#38bdf8;}input,button{margin:8px 0;padding:8px;border-radius:6px;border:none;}button{background:#facc15;color:#111827;font-weight:600;}</style>"
+    "</head><body>"
+    "<h1>Cowboy Hat OS · File Upload</h1>"
+    "<form method='POST' action='/upload' enctype='multipart/form-data'>"
+    "<input type='file' name='data'><br>"
+    "<button type='submit'>Upload</button>"
+    "</form>"
+    "<p>Upload HTML/CSS/JS or other assets.</p>"
+    "</body></html>"
+  );
+  uploadPage.close();
 
   setupOLED();
   setupWiFiAP();
@@ -196,8 +221,6 @@ void setup() {
 
 // ================== LOOP ==================
 void loop() {
-  server.handleClient();
-
   readIMU(imu);
   readRadar(radar);
 
@@ -246,110 +269,128 @@ void loop() {
 void setupWiFiAP() {
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
 }
 
 void setupWebServer() {
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/state", HTTP_GET, handleStateJson);
-  server.on("/mode", HTTP_POST, handleModeChange);
-  server.on("/phone", HTTP_POST, handlePhoneUpdate);
-  server.on("/sensitivity", HTTP_POST, handleSensitivityChange);
-  server.onNotFound(handleNotFound);
-  server.begin();
-}
+  // Root UI
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", HTML_ROOT);
+  });
 
-void handleRoot() {
-  String html = F(
-    "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'/>"
-    "<style>"
-    "body{background:#020617;color:#e5e7eb;font-family:sans-serif;padding:16px;}"
-    "h1{color:#38bdf8;margin-bottom:4px;}"
-    "h2{color:#facc15;margin-top:0;}"
-    "button{padding:8px 12px;margin:4px;border-radius:6px;border:none;background:#facc15;color:#111827;font-weight:600;}"
-    "pre{background:#020617;border:1px solid #1f2937;padding:8px;border-radius:6px;}"
-    "</style></head><body>"
-    "<h1>Go Time Software</h1>"
-    "<h2>Cowboy Hat OS</h2>"
-    "<button onclick='setMode(0)'>Awareness</button>"
-    "<button onclick='setMode(1)'>Compass</button>"
-    "<button onclick='setMode(2)'>Navigation</button>"
-    "<button onclick='setMode(3)'>Stealth</button>"
-    "<button onclick='setMode(4)'>System</button>"
-    "<button onclick='setMode(5)'>Weather</button>"
-    "<h3>Sensitivity</h3>"
-    "<button onclick='setSense(0)'>Crowd</button>"
-    "<button onclick='setSense(1)'>Balanced</button>"
-    "<button onclick='setSense(2)'>Home-Alone</button>"
-    "<h3>State</h3><pre id='stateBox'></pre>"
-    "<script>"
-    "function fetchState(){fetch('/state').then(r=>r.json()).then(j=>{"
-      "document.getElementById('stateBox').innerText=JSON.stringify(j,null,2);"
-    "});}"
-    "function setMode(m){fetch('/mode',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'mode='+m}).then(fetchState);}"
-    "function setSense(s){fetch('/sensitivity',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'sense='+s}).then(fetchState);}"
-    "setInterval(fetchState,1000);fetchState();"
-    "</script></body></html>"
+  // State JSON
+  server.on("/state", HTTP_GET, [](AsyncWebServerRequest *request){
+    String json = "{";
+    json += "\"mode\":" + String((int)currentMode) + ",";
+    json += "\"sensitivity\":" + String((int)safetyMode) + ",";
+    json += "\"danger\":" + String(phone.danger ? "true" : "false") + ",";
+    json += "\"heading\":" + String(phone.headingDeg, 1) + ",";
+    json += "\"direction\":\"" + phone.direction + "\",";
+    json += "\"objectType\":\"" + phone.objectType + "\",";
+    json += "\"objectDir\":\"" + phone.objectDir + "\",";
+    json += "\"objectSpeed\":\"" + phone.objectSpeed + "\",";
+    json += "\"weather\":\"" + phone.weatherSummary + "\",";
+    json += "\"tempC\":" + String(phone.tempC, 1) + ",";
+    json += "\"windKph\":" + String(phone.windKph, 1) + ",";
+    json += "\"userSpeedMps\":" + String(userSpeedMps, 2) + ",";
+    json += "\"phoneSpeedMps\":" + String(phone.speedMps, 2) + ",";
+    json += "\"phoneHasSpeed\":" + String(phone.hasSpeed ? "true" : "false");
+    json += "}";
+    request->send(200, "application/json", json);
+  });
+
+  // Mode change
+  server.on("/mode", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (request->hasParam("mode", true)) {
+      AsyncWebParameter* p = request->getParam("mode", true);
+      int m = p->value().toInt();
+      if (m >= 0 && m <= 5) currentMode = (HatMode)m;
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  // Sensitivity change
+  server.on("/sensitivity", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (request->hasParam("sense", true)) {
+      AsyncWebParameter* p = request->getParam("sense", true);
+      int s = p->value().toInt();
+      if (s >= 0 && s <= 2) safetyMode = (SensitivityMode)s;
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  // Phone update
+  server.on("/phone", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (request->hasParam("heading", true))    phone.headingDeg = request->getParam("heading", true)->value().toFloat();
+    if (request->hasParam("direction", true))  phone.direction = request->getParam("direction", true)->value();
+    if (request->hasParam("nav", true))        phone.navInstruction = request->getParam("nav", true)->value();
+    if (request->hasParam("objType", true))    phone.objectType = request->getParam("objType", true)->value();
+    if (request->hasParam("objDir", true))     phone.objectDir = request->getParam("objDir", true)->value();
+    if (request->hasParam("objSpeed", true))   phone.objectSpeed = request->getParam("objSpeed", true)->value();
+    if (request->hasParam("danger", true)) {
+      String d = request->getParam("danger", true)->value();
+      phone.danger = (d == "1" || d == "true");
+    }
+    if (request->hasParam("weather", true))    phone.weatherSummary = request->getParam("weather", true)->value();
+    if (request->hasParam("temp", true))       phone.tempC = request->getParam("temp", true)->value().toFloat();
+    if (request->hasParam("wind", true))       phone.windKph = request->getParam("wind", true)->value().toFloat();
+    if (request->hasParam("speed", true)) {
+      phone.speedMps = request->getParam("speed", true)->value().toFloat();
+      phone.hasSpeed = true;
+    }
+
+    request->send(200, "text/plain", "PHONE UPDATE OK");
+  });
+
+  // Secure SPIFFS uploader
+  server.on("/upload", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!request->authenticate(UPLOAD_USER, UPLOAD_PASS))
+      return request->requestAuthentication();
+    request->send(SPIFFS, "/upload.html", "text/html");
+  });
+
+  server.on(
+    "/upload",
+    HTTP_POST,
+    [](AsyncWebServerRequest *request){
+      if (!request->authenticate(UPLOAD_USER, UPLOAD_PASS))
+        return request->requestAuthentication();
+      request->send(200, "text/plain", "Upload complete. Refresh the page.");
+    },
+    [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final){
+      if (!request->authenticate(UPLOAD_USER, UPLOAD_PASS))
+        return;
+
+      String path = "/" + filename;
+
+      if (index == 0) {
+        Serial.printf("UploadStart: %s\n", filename.c_str());
+        if (SPIFFS.exists(path)) {
+          SPIFFS.remove(path);
+        }
+      }
+
+      File f = SPIFFS.open(path, FILE_APPEND);
+      if (!f) {
+        Serial.println("File open failed");
+        return;
+      }
+      f.write(data, len);
+      f.close();
+
+      if (final) {
+        Serial.printf("UploadEnd: %s (%u bytes)\n", filename.c_str(), index + len);
+      }
+    }
   );
-  server.send(200, "text/html", html);
-}
 
-void handleStateJson() {
-  String json = "{";
-  json += "\"mode\":" + String((int)currentMode) + ",";
-  json += "\"sensitivity\":" + String((int)safetyMode) + ",";
-  json += "\"danger\":" + String(phone.danger ? "true" : "false") + ",";
-  json += "\"heading\":" + String(phone.headingDeg, 1) + ",";
-  json += "\"direction\":\"" + phone.direction + "\",";
-  json += "\"objectType\":\"" + phone.objectType + "\",";
-  json += "\"objectDir\":\"" + phone.objectDir + "\",";
-  json += "\"objectSpeed\":\"" + phone.objectSpeed + "\",";
-  json += "\"weather\":\"" + phone.weatherSummary + "\",";
-  json += "\"tempC\":" + String(phone.tempC, 1) + ",";
-  json += "\"windKph\":" + String(phone.windKph, 1) + ",";
-  json += "\"userSpeedMps\":" + String(userSpeedMps, 2) + ",";
-  json += "\"phoneSpeedMps\":" + String(phone.speedMps, 2) + ",";
-  json += "\"phoneHasSpeed\":" + String(phone.hasSpeed ? "true" : "false");
-  json += "}";
-  server.send(200, "application/json", json);
-}
+  server.onNotFound([](AsyncWebServerRequest *request){
+    request->send(404, "text/plain", "Not found");
+  });
 
-void handleModeChange() {
-  if (server.hasArg("mode")) {
-    int m = server.arg("mode").toInt();
-    if (m >= 0 && m <= 5) currentMode = (HatMode)m;
-  }
-  server.send(200, "text/plain", "OK");
-}
-
-void handleSensitivityChange() {
-  if (server.hasArg("sense")) {
-    int s = server.arg("sense").toInt();
-    if (s >= 0 && s <= 2) safetyMode = (SensitivityMode)s;
-  }
-  server.send(200, "text/plain", "OK");
-}
-
-void handlePhoneUpdate() {
-  if (server.hasArg("heading"))    phone.headingDeg = server.arg("heading").toFloat();
-  if (server.hasArg("direction"))  phone.direction = server.arg("direction");
-  if (server.hasArg("nav"))        phone.navInstruction = server.arg("nav");
-  if (server.hasArg("objType"))    phone.objectType = server.arg("objType");
-  if (server.hasArg("objDir"))     phone.objectDir = server.arg("objDir");
-  if (server.hasArg("objSpeed"))   phone.objectSpeed = server.arg("objSpeed");
-  if (server.hasArg("danger"))     phone.danger = (server.arg("danger") == "1" || server.arg("danger") == "true");
-  if (server.hasArg("weather"))    phone.weatherSummary = server.arg("weather");
-  if (server.hasArg("temp"))       phone.tempC = server.arg("temp").toFloat();
-  if (server.hasArg("wind"))       phone.windKph = server.arg("wind").toFloat();
-  if (server.hasArg("speed")) {
-    phone.speedMps = server.arg("speed").toFloat();
-    phone.hasSpeed = true;
-  }
-
-  server.send(200, "text/plain", "PHONE UPDATE OK");
-}
-
-void handleNotFound() {
-  server.send(404, "text/plain", "Not found");
+  server.begin();
+  Serial.println("Cowboy Hat OS (ESP32-C3) server started (Async + secure uploader)");
 }
 
 // ================== OLED HUD ==================
