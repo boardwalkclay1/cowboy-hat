@@ -1,38 +1,65 @@
 /****************************************************
  *  COWBOY HAT OS – GO TIME EDITION (Speed Fusion)
- *  - ESP8266 + OLED + 4 Vibration Motors
- *  - Phone-driven awareness + radar + IMU gestures
- *  - Modes, sensitivity profiles, danger override
- *  - Walking speed from:
- *      1) Phone GPS speed (preferred)
- *      2) IMU step frequency
- *      3) IMU acceleration integration
+ *  Unified ESP build: ESP8266 + ESP32 + ESP32-C3
  ****************************************************/
 
 #include <Arduino.h>
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+
+// ================== BOARD SELECTION ==================
+#if defined(ARDUINO_ARCH_ESP8266)
+  #include <ESP8266WiFi.h>
+  #include <ESP8266WebServer.h>
+  ESP8266WebServer server(80);
+
+  // Vibration motors (ESP8266 D-pins)
+  #define VIB_FRONT  5   // D1
+  #define VIB_BACK   4   // D2
+  #define VIB_LEFT   0   // D3
+  #define VIB_RIGHT  2   // D4
+
+  // I2C default
+  #define OLED_SDA   SDA
+  #define OLED_SCL   SCL
+
+#elif defined(ARDUINO_ARCH_ESP32)
+  #include <WiFi.h>
+  #include <WebServer.h>
+  WebServer server(80);
+
+  // Safe default pins for ESP32 / ESP32-C3 (adjust as needed)
+  // For ESP32-C3, these are typical safe GPIOs (no boot strapping conflict)
+  #if defined(CONFIG_IDF_TARGET_ESP32C3)
+    #define VIB_FRONT  4
+    #define VIB_BACK   5
+    #define VIB_LEFT   6
+    #define VIB_RIGHT  7
+    #define OLED_SDA   8
+    #define OLED_SCL   9
+  #else
+    // Generic ESP32 defaults (you can remap to your wiring)
+    #define VIB_FRONT  14
+    #define VIB_BACK   27
+    #define VIB_LEFT   26
+    #define VIB_RIGHT  25
+    #define OLED_SDA   21
+    #define OLED_SCL   22
+  #endif
+
+#else
+  #error "This sketch requires ESP8266 or ESP32/ESP32-C3."
+#endif
 
 // ================== CONFIG ==================
 const char* AP_SSID     = "CowboyHatOS-GoTime";
 const char* AP_PASSWORD = "boardwalk";
 
-// Vibration motors
-#define VIB_FRONT  5   // D1
-#define VIB_BACK   4   // D2
-#define VIB_LEFT   0   // D3
-#define VIB_RIGHT  2   // D4
-
 // OLED
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-
-// Web server
-ESP8266WebServer server(80);
 
 // ================== MODES ==================
 enum HatMode {
@@ -61,10 +88,9 @@ struct IMUState {
   float roll;
   float yawRate;
 
-  // Speed-related
-  float forwardAccel;    // m/s^2 (estimated along direction of travel)
+  float forwardAccel;    // m/s^2
   float stepFrequency;   // steps per second
-  bool  stepDetected;    // true when a step event is detected this frame
+  bool  stepDetected;
 };
 
 struct PhoneState {
@@ -74,17 +100,15 @@ struct PhoneState {
 
   String objectType;
   String objectDir;
-  String objectSpeed;    // "slow", "medium", "fast"
+  String objectSpeed;
   bool   danger;
 
-  // Weather
   String weatherSummary;
   float  tempC;
   float  windKph;
 
-  // Speed from phone (GPS)
   bool  hasSpeed;
-  float speedMps;        // meters per second
+  float speedMps;
 };
 
 struct RadarState {
@@ -98,7 +122,6 @@ IMUState imu;
 PhoneState phone;
 RadarState radar;
 
-// User speed (fused)
 float userSpeedMps = 0.0;
 
 // Gesture thresholds
@@ -152,7 +175,7 @@ void setup() {
   pinMode(VIB_LEFT,  OUTPUT);
   pinMode(VIB_RIGHT, OUTPUT);
 
-  Wire.begin();
+  Wire.begin(OLED_SDA, OLED_SCL);
 
   setupOLED();
   setupWiFiAP();
@@ -178,20 +201,15 @@ void loop() {
   readIMU(imu);
   readRadar(radar);
 
-  // Compute fused user walking speed
   computeUserSpeed();
-
   processGestures();
 
-  // Danger override
   if (phone.danger) {
     vibrateDangerLoop();
   } else {
-    // Determine object speed in m/s from label
     float objectSpeedMps = mapObjectSpeedToMps(phone.objectSpeed);
     float relativeSpeed = objectSpeedMps - userSpeedMps;
 
-    // Sensitivity logic
     bool shouldAlert = false;
 
     if (safetyMode == SENSE_CROWD) {
@@ -207,8 +225,7 @@ void loop() {
       if (phone.objectSpeed != "none") shouldAlert = true;
     }
 
-    // Relative speed danger: if something is gaining on you fast
-    const float RELATIVE_DANGER_THRESHOLD = 2.0; // m/s faster than you
+    const float RELATIVE_DANGER_THRESHOLD = 2.0;
     if (relativeSpeed > RELATIVE_DANGER_THRESHOLD && safetyMode != SENSE_CROWD) {
       phone.danger = true;
     }
@@ -358,7 +375,6 @@ void drawHUD() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
-  // Danger override
   if (phone.danger) {
     display.setTextSize(2);
     display.setCursor(0, 0);
@@ -481,19 +497,16 @@ void drawHUD() {
 
 // ================== IMU + RADAR STUBS ==================
 void readIMU(IMUState &s) {
-  // TODO: replace with real IMU reads
   s.pitch = 0;
   s.roll = 0;
   s.yawRate = 0;
 
-  // Speed-related stubs
-  s.forwardAccel = 0;     // m/s^2
-  s.stepFrequency = 0;    // steps per second
-  s.stepDetected = false; // set true when you detect a step
+  s.forwardAccel = 0;
+  s.stepFrequency = 0;
+  s.stepDetected = false;
 }
 
 void readRadar(RadarState &r) {
-  // TODO: replace with real radar reads
   r.motionFront = false;
   r.motionBack = false;
   r.strengthFront = 0;
@@ -509,7 +522,7 @@ void processGestures() {
 }
 
 void onNod() {
-  // Select / confirm – customize per mode if needed
+  // Hook for confirm/select
 }
 
 void onTiltLeft() {
@@ -578,35 +591,28 @@ void vibrateDangerLoop() {
 // ================== SPEED FUSION ==================
 void computeUserSpeed() {
   unsigned long now = millis();
-  float dt = (now - lastSpeedUpdateMs) / 1000.0; // seconds
+  float dt = (now - lastSpeedUpdateMs) / 1000.0;
   if (dt <= 0) dt = 0.01;
   lastSpeedUpdateMs = now;
 
-  // 1) Prefer phone GPS speed if available
   if (phone.hasSpeed) {
     userSpeedMps = phone.speedMps;
     return;
   }
 
-  // 2) Use IMU step frequency if step detected / stable
   if (imu.stepFrequency > 0.1f) {
-    // Approximate step length (m). You can calibrate this.
     const float STEP_LENGTH_M = 0.78f;
     userSpeedMps = imu.stepFrequency * STEP_LENGTH_M;
     return;
   }
 
-  // 3) Fallback: integrate forward acceleration
-  // Very rough, but better than nothing
   userSpeedMps += imu.forwardAccel * dt;
-
-  // Clamp to non-negative
   if (userSpeedMps < 0) userSpeedMps = 0;
 }
 
 float mapObjectSpeedToMps(const String &speedStr) {
-  if (speedStr == "slow")   return 1.0; // ~3.6 km/h
-  if (speedStr == "medium") return 3.0; // ~10.8 km/h
-  if (speedStr == "fast")   return 6.0; // ~21.6 km/h
+  if (speedStr == "slow")   return 1.0;
+  if (speedStr == "medium") return 3.0;
+  if (speedStr == "fast")   return 6.0;
   return 0.0;
 }
