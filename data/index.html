@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<style>
+body {
+  margin: 0;
+  padding: 0;
+  background: #0b0b0b;
+  font-family: 'Segoe UI', sans-serif;
+  color: #d7d7d7;
+}
+
+/* HEADER BAR */
+.header {
+  background: linear-gradient(90deg, #ff2a2a, #7a0000);
+  padding: 18px;
+  text-align: center;
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: #f5f5f5;
+  border-bottom: 2px solid #d7d7d7;
+  text-transform: uppercase;
+}
+
+/* PHOTO PANEL */
+.photo-box {
+  width: 100%;
+  height: 180px;
+  background: #1a1a1a;
+  border-bottom: 2px solid #ff2a2a;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.photo-box img {
+  max-height: 100%;
+  max-width: 100%;
+  object-fit: cover;
+}
+
+/* BUTTONS */
+button {
+  width: 90%;
+  margin: 10px auto;
+  display: block;
+  padding: 14px;
+  background: #1a1a1a;
+  border: 2px solid #ff2a2a;
+  border-radius: 10px;
+  color: #d7d7d7;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  transition: 0.2s;
+}
+
+button:hover {
+  background: #ff2a2a;
+  color: #0b0b0b;
+  transform: scale(1.03);
+}
+
+/* STATE BOX */
+#stateBox {
+  width: 90%;
+  margin: 20px auto;
+  padding: 15px;
+  background: #1a1a1a;
+  border: 2px solid #d7d7d7;
+  border-radius: 10px;
+  color: #ff2a2a;
+  font-size: 14px;
+  white-space: pre-wrap;
+}
+</style>
+</head>
+
+<body>
+
+<div class="header">StrikeForge Panel</div>
+
+<div class="photo-box">
+  <!-- You will insert your image here -->
+  <img src="yourphoto.jpg" id="mainPhoto">
+</div>
+
+<button onclick="setMode(0)">Awareness</button>
+<button onclick="setMode(1)">Compass</button>
+<button onclick="setMode(2)">Navigation</button>
+<button onclick="setMode(3)">Stealth</button>
+<button onclick="setMode(4)">System</button>
+<button onclick="setMode(5)">Weather</button>
+
+<button onclick="setSense(0)">Crowd Mode</button>
+<button onclick="setSense(1)">Balanced Mode</button>
+<button onclick="setSense(2)">Home-Alone Mode</button>
+
+<pre id="stateBox">Loading...</pre>
+
+<script>
+function fetchState(){
+  fetch('/state')
+    .then(r => r.json())
+    .then(j => {
+      document.getElementById('stateBox').innerText =
+        JSON.stringify(j, null, 2);
+    });
+}
+
+function setMode(m){
+  fetch('/mode', {
+    method: 'POST',
+    headers: {'Content-Type':'application/x-www-form-urlencoded'},
+    body: 'mode=' + m
+  }).then(fetchState);
+}
+
+function setSense(s){
+  fetch('/sensitivity', {
+    method: 'POST',
+    headers: {'Content-Type':'application/x-www-form-urlencoded'},
+    body: 'sense=' + s
+  }).then(fetchState);
+}
+
+setInterval(fetchState, 1000);
+fetchState();
+</script>
+
+</body>
+</html>
